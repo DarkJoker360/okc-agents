@@ -1,27 +1,199 @@
-on: push
+name: Build OpenKeychain Agents
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - master
+      - main
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        target: [x86_64-linux-android, i686-linux-android, aarch64-linux-android, armv7-linux-androideabi]
-    runs-on: ubuntu-20.04
+        target:
+          - x86_64-linux-android
+          - i686-linux-android
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+        include:
+          - target: x86_64-linux-android
+            arch: x86_64
+          - target: i686-linux-android
+            arch: x86
+          - target: aarch64-linux-android
+            arch: arm64-v8a
+          - target: armv7-linux-androideabi
+            arch: armeabi-v7a
+
     steps:
-      - uses: actions/checkout@master
-      - env:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+          add-to-path: false
+          local-cache: true
+
+      - name: Configure build environment
+        env:
           TARGET: ${{ matrix.target }}
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
         run: |
-          rustup update
-          rustup target add $TARGET
-          ./build-termux.sh
-          tar czf release.tar.gz -C target/$TARGET/debug okc-ssh-agent okc-gpg
-      - if: github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/')
+          echo "ANDROID_SDK_ROOT=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
+
+          # Configure target-specific linker
+          TARGET_UPPER=$(echo ${TARGET} | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          NDK_TARGET=${TARGET/armv7-/armv7a-}
+
+          # Find the appropriate clang binary
+          CLANG_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/${NDK_TARGET}30-clang"
+
+          echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${CLANG_BIN}" >> $GITHUB_ENV
+          echo "RUSTFLAGS=-C link-arg=-Wl,-rpath=/data/data/com.termux/files/usr/lib -C link-arg=-Wl,--enable-new-dtags" >> $GITHUB_ENV
+
+          # Make linker wrapper executable
+          chmod +x ./linker-wrapper.sh
+
+      - name: Build release binaries
         run: |
-          git fetch --unshallow --tags
-          mkdir -p ~/.ssh
-          echo ${{ secrets.DEPLOYKEY }} | base64 -d > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-          ssh-keyscan web.sourceforge.net > ~/.ssh/known_hosts
-          scp \
-              release.tar.gz \
-              ddosolitary@web.sourceforge.net:/home/project-web/ddosolitary-builds/htdocs/okc-agents/okc-agents-$(git describe --tags)-$(echo ${{ matrix.target }} | cut -d - -f 1).tar.gz
+          cargo build --release --target=${{ matrix.target }} --bin okc-ssh-agent
+
+      - name: Create release archive
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar czf ../../../okc-agents-${{ matrix.arch }}.tar.gz okc-ssh-agent
+          cd ../../..
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: okc-agents-${{ matrix.arch }}
+          path: okc-agents-${{ matrix.arch }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release
+          find artifacts -name "*.tar.gz" -exec cp {} release/ \;
+          ls -lh release/
+
+      - name: Generate release notes
+        id: notes
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+          cat > release_notes.md << 'EOF'
+          ## OKC Agents ${VERSION}
+
+          Rust-based SSH agent for Termux that integrates with OpenKeychain.
+
+          ### Installation
+
+          1. Download the appropriate binary for your architecture:
+             - `okc-agents-arm64-v8a.tar.gz` for 64-bit ARM devices (most modern phones)
+             - `okc-agents-armeabi-v7a.tar.gz` for 32-bit ARM devices
+             - `okc-agents-x86_64.tar.gz` for 64-bit x86 devices
+             - `okc-agents-x86.tar.gz` for 32-bit x86 devices
+
+          2. Extract in Termux:
+             ```bash
+             tar xzf okc-agents-*.tar.gz -C $PREFIX/bin/
+             chmod +x $PREFIX/bin/okc-ssh-agent
+             ```
+
+          3. Configure SSH to use the agent:
+             ```bash
+             echo "export SSH_AUTH_SOCK=$PREFIX/var/run/okc-ssh-agent.sock" >> ~/.bashrc
+             okc-ssh-agent &
+             ```
+
+          ### What's Changed
+
+          See commit history for details.
+
+          ### Checksums
+
+          EOF
+
+          cd release
+          sha256sum *.tar.gz >> ../release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.tar.gz
+          body_path: release_notes.md
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  test:
+    name: Run tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --all-features
+
+      - name: Run clippy
+        run: cargo clippy

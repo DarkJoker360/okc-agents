@@ -20,7 +20,7 @@ use std::time::Duration;
 use futures_util::{StreamExt, TryFutureExt};
 use futures_util::future;
 use slog::Logger;
-use tokio::io::{self, AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::signal::unix::{Signal, SignalKind, signal};
@@ -35,36 +35,91 @@ const SOCKET_DIR_TEMPLATE: &str = "okc-ssh-XXXXXXXXXX";
 const AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
 const AGENT_PID_ENV: &str = "SSH_AGENT_PID";
 
-async fn do_copy<T1, T2>(rx: &mut T1, tx: &mut T2) -> std::result::Result<(), io::Error>
-	where T1: AsyncRead + Unpin, T2: AsyncWrite + Unpin
-{
-	io::copy(rx, tx).await?;
-	tx.shutdown().await?;
-	Ok(())
-}
-
 async fn handle_connection(accept_result: std::result::Result<UnixStream, io::Error>, logger: Logger) -> Result {
 	let mut client_stream = accept_result?;
 	info!(logger, "connected to client");
-	let (mut crx, mut ctx) = client_stream.split();
+
 	let addr = "127.0.0.1:0".parse::<SocketAddr>()?;
 	let app_listener = TcpListener::bind(&addr).await?;
 	let addr = app_listener.local_addr()?;
 	info!(logger, "listening on port {}", addr.port());
+	
 	Command::new("am").arg("broadcast")
-		.arg("-n").arg("org.ddosolitary.okcagent/.SshProxyReceiver")
-		.arg("--ei").arg("org.ddosolitary.okcagent.extra.SSH_PROTO_VER").arg(PROTO_VER.to_string())
-		.arg("--ei").arg("org.ddosolitary.okcagent.extra.PROXY_PORT").arg(addr.port().to_string())
+		.arg("-n").arg("org.sufficientlysecure.keychain.yubikey/org.sufficientlysecure.keychain.ssh.SshAgentBroadcastReceiver")
+		.arg("--ei").arg("org.sufficientlysecure.keychain.extra.SSH_PROTO_VER").arg(PROTO_VER.to_string())
+		.arg("--ei").arg("org.sufficientlysecure.keychain.extra.PROXY_PORT").arg(addr.port().to_string())
 		.stdout(Stdio::null()).stderr(Stdio::null())
 		.status().await?;
 	info!(logger, "broadcast sent, waiting for app to connect");
-	let mut app_stream = time::timeout(Duration::from_secs(10), TcpListenerStream::new(app_listener).next()).await
-		.map_err(|_| StringError::new("timed out waiting for app to connect"))?.unwrap()?;
+	
+	// Wait for app connection with timeout
+	let app_stream = match time::timeout(Duration::from_secs(10), TcpListenerStream::new(app_listener).next()).await {
+		Ok(Some(Ok(stream))) => stream,
+		Ok(Some(Err(e))) => {
+			error!(logger, "Failed to accept app connection: {}", e);
+			return Err(e.into());
+		}
+		Ok(None) => {
+			error!(logger, "App listener stream ended unexpectedly");
+			return Err(Box::new(StringError::new("App listener stream ended")));
+		}
+		Err(_) => {
+			error!(logger, "Timeout waiting for app to connect");
+			return Err(Box::new(StringError::new("Timed out waiting for app to connect")));
+		}
+	};
+	
+	let mut app_stream = app_stream;
 	info!(logger, "app connected, start forwarding"; "remote_port" => app_stream.peer_addr()?.port());
-	let (mut arx, mut atx) = app_stream.split();
-	let (r1, r2) = future::join(do_copy(&mut crx, &mut atx), do_copy(&mut arx, &mut ctx)).await;
-	r1?;
-	r2?;
+
+	let mut client_buf = vec![0u8; 65536];
+	let mut app_buf = vec![0u8; 65536];
+
+	loop {
+		tokio::select! {
+			// Forward from client to app
+			result = client_stream.read(&mut client_buf) => {
+				match result {
+					Ok(0) => {
+						info!(logger, "Client closed connection");
+						app_stream.shutdown().await?;
+						break;
+					}
+					Ok(n) => {
+						trace!(logger, "Forwarding {} bytes from client to app", n);
+						app_stream.write_all(&client_buf[..n]).await?;
+						app_stream.flush().await?;
+					}
+					Err(e) => {
+						error!(logger, "Error reading from client: {}", e);
+						let _ = app_stream.shutdown().await;
+						return Err(e.into());
+					}
+				}
+			}
+			// Forward from app to client
+			result = app_stream.read(&mut app_buf) => {
+				match result {
+					Ok(0) => {
+						info!(logger, "App closed connection");
+						client_stream.shutdown().await?;
+						break;
+					}
+					Ok(n) => {
+						trace!(logger, "Forwarding {} bytes from app to client", n);
+						client_stream.write_all(&app_buf[..n]).await?;
+						client_stream.flush().await?;
+					}
+					Err(e) => {
+						error!(logger, "Error reading from app: {}", e);
+						let _ = client_stream.shutdown().await;
+						return Err(e.into());
+					}
+				}
+			}
+		}
+	}
+
 	info!(logger, "connection finished");
 	Ok(())
 }
@@ -80,13 +135,19 @@ async fn run(listener: StdUnixListener, logger: Logger) -> Result {
 	let listener = UnixListener::from_std(listener)?;
 
 	let counter = AtomicU64::new(0);
-	UnixListenerStream::new(listener).for_each_concurrent(Some(4), |accept_result| async {
+	
+	let mut stream = UnixListenerStream::new(listener);
+	while let Some(accept_result) = stream.next().await {
 		let logger = logger.new(o!("id" => counter.fetch_add(1, Ordering::Relaxed)));
-		debug!(logger, "new incoming connection");
+		info!(logger, "new incoming connection");
+		
 		if let Err(e) = handle_connection(accept_result, logger.clone()).await {
-			error!(logger, "failed to accept the connection: {:?}", e);
+			error!(logger, "failed to handle connection: {:?}", e);
 		}
-	}).await;
+		
+		// Small delay to prevent rapid reconnection spam
+		tokio::time::sleep(Duration::from_millis(10)).await;
+	}
 
 	Ok(())
 }
@@ -284,12 +345,12 @@ fn main() {
 
 	if cmd.is_none() {
 		if is_csh {
-			println!("setenv {} {:?};", AUTH_SOCK_ENV, socket_file.to_string_lossy());
+			println!("setenv {} {};", AUTH_SOCK_ENV, socket_file.to_string_lossy());
 			if !is_foreground {
 				println!("setenv {} {};", AGENT_PID_ENV, pid);
 			}
 		} else {
-			println!("{}={:?}; export {0};", AUTH_SOCK_ENV, socket_file.to_string_lossy());
+			println!("{}={}; export {};", AUTH_SOCK_ENV, socket_file.to_string_lossy(), AUTH_SOCK_ENV);
 			if !is_foreground {
 				println!("{}={}; export {0};", AGENT_PID_ENV, pid);
 			}
