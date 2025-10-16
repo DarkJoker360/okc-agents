@@ -45,7 +45,7 @@ async fn handle_connection(accept_result: std::result::Result<UnixStream, io::Er
 	info!(logger, "listening on port {}", addr.port());
 	
 	Command::new("am").arg("broadcast")
-		.arg("-n").arg("org.sufficientlysecure.keychain/.ssh.SshAgentBroadcastReceiver")
+		.arg("-n").arg("org.sufficientlysecure.keychain.yubikey/org.sufficientlysecure.keychain.ssh.SshAgentBroadcastReceiver")
 		.arg("--ei").arg("org.sufficientlysecure.keychain.extra.SSH_PROTO_VER").arg(PROTO_VER.to_string())
 		.arg("--ei").arg("org.sufficientlysecure.keychain.extra.PROXY_PORT").arg(addr.port().to_string())
 		.stdout(Stdio::null()).stderr(Stdio::null())
