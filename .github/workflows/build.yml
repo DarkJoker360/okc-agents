@@ -72,14 +72,26 @@ jobs:
           echo "ANDROID_SDK_ROOT=$ANDROID_NDK_HOME" >> $GITHUB_ENV
           echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME" >> $GITHUB_ENV
 
-          # Configure target-specific linker
+          # Configure target-specific environment variables
           TARGET_UPPER=$(echo ${TARGET} | tr '[:lower:]' '[:upper:]' | tr '-' '_')
+          TARGET_UNDERSCORE=$(echo ${TARGET} | tr '-' '_')
           NDK_TARGET=${TARGET/armv7-/armv7a-}
 
-          # Find the appropriate clang binary
-          CLANG_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin/${NDK_TARGET}30-clang"
+          # NDK toolchain paths
+          TOOLCHAIN_BIN="${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          CLANG_BIN="${TOOLCHAIN_BIN}/${NDK_TARGET}30-clang"
+          AR_BIN="${TOOLCHAIN_BIN}/llvm-ar"
 
+          # Set Cargo linker for the target
           echo "CARGO_TARGET_${TARGET_UPPER}_LINKER=${CLANG_BIN}" >> $GITHUB_ENV
+          
+          # Set CC and AR for the cc crate (used by ring and other native dependencies)
+          echo "CC_${TARGET_UNDERSCORE}=${CLANG_BIN}" >> $GITHUB_ENV
+          echo "AR_${TARGET_UNDERSCORE}=${AR_BIN}" >> $GITHUB_ENV
+          echo "CC=${CLANG_BIN}" >> $GITHUB_ENV
+          echo "AR=${AR_BIN}" >> $GITHUB_ENV
+          
+          # Set RUSTFLAGS for linking
           echo "RUSTFLAGS=-C link-arg=-Wl,-rpath=/data/data/com.termux/files/usr/lib -C link-arg=-Wl,--enable-new-dtags" >> $GITHUB_ENV
 
           # Make linker wrapper executable

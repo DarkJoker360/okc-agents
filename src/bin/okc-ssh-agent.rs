@@ -14,9 +14,9 @@ use std::net::SocketAddr;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::Duration as StdDuration;
 use futures_util::{StreamExt, TryFutureExt};
 use futures_util::future;
 use slog::Logger;
@@ -24,18 +24,72 @@ use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::process::Command;
 use tokio::signal::unix::{Signal, SignalKind, signal};
-use tokio::time;
+use tokio::time as tokio_time;
+use time::{OffsetDateTime, Duration as TimeDuration};
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
+use tokio_rustls::{TlsAcceptor, rustls};
+use rustls::ServerConfig;
+use sha2::{Sha256, Digest};
+use rand::Rng;
 use okc_agents::utils::*;
 
 type StdUnixListener = std::os::unix::net::UnixListener;
 
-const PROTO_VER: i32 = 0;
+const PROTO_VER: i32 = 1;
 const SOCKET_DIR_TEMPLATE: &str = "okc-ssh-XXXXXXXXXX";
 const AUTH_SOCK_ENV: &str = "SSH_AUTH_SOCK";
 const AGENT_PID_ENV: &str = "SSH_AGENT_PID";
 
-async fn handle_connection(accept_result: std::result::Result<UnixStream, io::Error>, logger: Logger) -> Result {
+/// Generate ephemeral self-signed certificate for TLS
+fn generate_tls_certificate(logger: &Logger) -> std::result::Result<(String, String, Vec<rustls::Certificate>, rustls::PrivateKey), Box<dyn std::error::Error>> {
+	info!(logger, "Generating ephemeral TLS certificate");
+
+	let mut params = rcgen::CertificateParams::new(vec!["localhost".to_string()]);
+	params.distinguished_name = rcgen::DistinguishedName::new();
+	params.distinguished_name.push(rcgen::DnType::CommonName, "OpenKeychain SSH Agent");
+
+	let now = OffsetDateTime::now_utc();
+	params.not_before = now;
+	params.not_after = now + TimeDuration::hours(24);
+
+	let cert = rcgen::Certificate::from_params(params)
+		.map_err(|e| format!("Failed to generate certificate: {}", e))?;
+
+	let cert_der = cert.serialize_der()
+		.map_err(|e| format!("Failed to serialize certificate DER: {}", e))?;
+
+	let cert_pem = cert.serialize_pem()
+		.map_err(|e| format!("Failed to serialize certificate: {}", e))?;
+	let _key_pem = cert.serialize_private_key_pem();
+
+	let mut hasher = Sha256::new();
+	hasher.update(&cert_der);
+	let hash = hasher.finalize();
+	let fingerprint = format!("sha256:{}", hex::encode(hash));
+
+	let cert_chain = vec![rustls::Certificate(cert_der.clone())];
+	let private_key = rustls::PrivateKey(cert.serialize_private_key_der());
+
+	info!(logger, "Certificate generated successfully"; "fingerprint" => &fingerprint);
+	Ok((cert_pem, fingerprint, cert_chain, private_key))
+}
+
+/// Generate random authentication token
+fn generate_auth_token(logger: &Logger) -> Vec<u8> {
+	let mut rng = rand::thread_rng();
+	let token: Vec<u8> = (0..32).map(|_| rng.gen()).collect();
+	info!(logger, "Generated authentication token"; "length" => token.len());
+	token
+}
+
+async fn handle_connection(
+	accept_result: std::result::Result<UnixStream, io::Error>,
+	tls_acceptor: TlsAcceptor,
+	auth_token: Vec<u8>,
+	cert_der: Vec<u8>,
+	fingerprint: String,
+	logger: Logger
+) -> Result {
 	let mut client_stream = accept_result?;
 	info!(logger, "connected to client");
 
@@ -43,17 +97,30 @@ async fn handle_connection(accept_result: std::result::Result<UnixStream, io::Er
 	let app_listener = TcpListener::bind(&addr).await?;
 	let addr = app_listener.local_addr()?;
 	info!(logger, "listening on port {}", addr.port());
-	
+
+	// Encode parameters as hex strings for broadcasting via am broadcast
+	let token_hex = hex::encode(&auth_token);
+	let cert_der_hex = hex::encode(&cert_der);
+
+	info!(logger, "sending broadcast";
+		"port" => addr.port(),
+		"fingerprint" => &fingerprint,
+		"cert_der_len" => cert_der.len(),
+		"cert_der_hex_len" => cert_der_hex.len());
+
 	Command::new("am").arg("broadcast")
 		.arg("-n").arg("org.sufficientlysecure.keychain.yubikey/org.sufficientlysecure.keychain.ssh.SshAgentBroadcastReceiver")
 		.arg("--ei").arg("org.sufficientlysecure.keychain.extra.SSH_PROTO_VER").arg(PROTO_VER.to_string())
 		.arg("--ei").arg("org.sufficientlysecure.keychain.extra.PROXY_PORT").arg(addr.port().to_string())
+		.arg("--es").arg("org.sufficientlysecure.keychain.extra.CERT_DER_HEX").arg(&cert_der_hex)
+		.arg("--es").arg("org.sufficientlysecure.keychain.extra.CERT_FINGERPRINT").arg(&fingerprint)
+		.arg("--es").arg("org.sufficientlysecure.keychain.extra.AUTH_TOKEN").arg(&token_hex)
 		.stdout(Stdio::null()).stderr(Stdio::null())
 		.status().await?;
-	info!(logger, "broadcast sent, waiting for app to connect");
-	
+	info!(logger, "broadcast sent successfully");
+
 	// Wait for app connection with timeout
-	let app_stream = match time::timeout(Duration::from_secs(10), TcpListenerStream::new(app_listener).next()).await {
+	let tcp_stream = match tokio_time::timeout(StdDuration::from_secs(10), TcpListenerStream::new(app_listener).next()).await {
 		Ok(Some(Ok(stream))) => stream,
 		Ok(Some(Err(e))) => {
 			error!(logger, "Failed to accept app connection: {}", e);
@@ -68,9 +135,48 @@ async fn handle_connection(accept_result: std::result::Result<UnixStream, io::Er
 			return Err(Box::new(StringError::new("Timed out waiting for app to connect")));
 		}
 	};
-	
-	let mut app_stream = app_stream;
-	info!(logger, "app connected, start forwarding"; "remote_port" => app_stream.peer_addr()?.port());
+
+	info!(logger, "app connected, performing TLS handshake"; "remote_port" => tcp_stream.peer_addr()?.port());
+
+	let mut app_stream = match tokio_time::timeout(StdDuration::from_secs(5), tls_acceptor.accept(tcp_stream)).await {
+		Ok(Ok(tls_stream)) => {
+			info!(logger, "TLS handshake completed successfully");
+			tls_stream
+		}
+		Ok(Err(e)) => {
+			error!(logger, "TLS handshake failed: {}", e);
+			return Err(Box::new(e));
+		}
+		Err(_) => {
+			error!(logger, "TLS handshake timeout");
+			return Err(Box::new(StringError::new("TLS handshake timeout")));
+		}
+	};
+
+	// Validate authentication token
+	let mut received_token = vec![0u8; 32];
+	match tokio_time::timeout(StdDuration::from_secs(2), app_stream.read_exact(&mut received_token)).await {
+		Ok(Ok(_)) => {
+			if received_token != auth_token {
+				error!(logger, "Invalid authentication token");
+				return Err(Box::new(StringError::new("Authentication failed")));
+			}
+
+			info!(logger, "Token validated successfully");
+
+			app_stream.write_all(b"OK").await?;
+		}
+		Ok(Err(e)) => {
+			error!(logger, "Failed to read auth token: {}", e);
+			return Err(e.into());
+		}
+		Err(_) => {
+			error!(logger, "Timeout reading auth token");
+			return Err(Box::new(StringError::new("Auth token timeout")));
+		}
+	}
+
+	info!(logger, "TLS connection established and authenticated, start forwarding");
 
 	let mut client_buf = vec![0u8; 65536];
 	let mut app_buf = vec![0u8; 65536];
@@ -132,21 +238,37 @@ lazy_static! {
 async fn run(listener: StdUnixListener, logger: Logger) -> Result {
 	info!(logger, "okc-ssh-agent"; "version" => env!("CARGO_PKG_VERSION"), "protocol_version" => PROTO_VER);
 
+	let (_cert_pem, fingerprint, cert_chain, private_key) = generate_tls_certificate(&logger)?;
+	let cert_der = cert_chain[0].0.clone();
+	let config = ServerConfig::builder()
+		.with_safe_defaults()
+		.with_no_client_auth()
+		.with_single_cert(cert_chain.clone(), private_key)
+		.map_err(|e| format!("Failed to create TLS config: {}", e))?;
+	let tls_acceptor = TlsAcceptor::from(Arc::new(config));
 	let listener = UnixListener::from_std(listener)?;
-
 	let counter = AtomicU64::new(0);
-	
+
 	let mut stream = UnixListenerStream::new(listener);
 	while let Some(accept_result) = stream.next().await {
 		let logger = logger.new(o!("id" => counter.fetch_add(1, Ordering::Relaxed)));
 		info!(logger, "new incoming connection");
-		
-		if let Err(e) = handle_connection(accept_result, logger.clone()).await {
+
+		let auth_token = generate_auth_token(&logger);
+
+		if let Err(e) = handle_connection(
+			accept_result,
+			tls_acceptor.clone(),
+			auth_token,
+			cert_der.clone(),
+			fingerprint.clone(),
+			logger.clone()
+		).await {
 			error!(logger, "failed to handle connection: {:?}", e);
 		}
-		
+
 		// Small delay to prevent rapid reconnection spam
-		tokio::time::sleep(Duration::from_millis(10)).await;
+		tokio_time::sleep(StdDuration::from_millis(10)).await;
 	}
 
 	Ok(())
